@@ -11,6 +11,8 @@ import json
 import logging
 import math
 import os
+import yaml 
+import platform
 from pathlib import Path
 from typing import Any
 
@@ -132,8 +134,9 @@ class Agent:
 
         # Each agent supplies its own opening messages: the standing
         # instructions, and the task statement that starts the run.
-        self.system_prompt: str = ""
-        self.task_prompt: str = ""
+
+        self.system_prompt = ""
+        self.task_prompt = ""
 
         self.api_prompts: list[list[dict[str, Any]]] = []
         self.api_responses: list[dict[str, Any]] = []
@@ -152,6 +155,7 @@ class Agent:
 
         # TODO(1.1.a): Add machinery to maintain agent state as it takes actions
         # and observes the results.
+        self.messages: list[dict[str, Any]] = []
 
     def load_skills(self, skills_path: Path) -> dict[str, dict[str, str]]:
         """Load the skill folders exposed to this agent."""
@@ -164,7 +168,55 @@ class Agent:
         # ``content`` of the skill file for ``invoke_skill``. Reject duplicate
         # names and malformed or missing frontmatter with a clear
         # ``ValueError``.
-        raise NotImplementedError
+        if not skills_path.is_dir():
+            raise ValueError(f"Skills path is not a directory: {skills_path}")
+
+        skills: dict[str, dict[str, str]] = {}
+        for child in sorted(skills_path.iterdir()):
+            if not child.is_dir():
+                continue
+            
+            skill_file = child / "SKILL.md"
+            if not skill_file.is_file():
+                raise ValueError(f"Missing SKILL.md in {child}")
+
+            text = skill_file.read_text(encoding="utf-8")
+
+            if not text.startswith("---"):
+                raise ValueError(f"Missing YAML frontmatter in {skill_file}")
+
+            end = text.find("---", 3)
+            if end == -1:
+                raise ValueError(f"Unclosed YAML frontmatter in {skill_file}")
+
+            frontmatter_text = text[3:end].strip()
+            content = text[end + 3:].strip()
+
+            try:
+                frontmatter = yaml.safe_load(frontmatter_text)
+            except yaml.YAMLError as exc:
+                raise ValueError(f"Invalid YAML in {skill_file}: {exc}")
+
+            if not isinstance(frontmatter, dict):
+                raise ValueError(f"Frontmatter must be a mapping in {skill_file}")
+
+            name = frontmatter.get("name")
+            description = frontmatter.get("description")
+
+            if not name or not description:
+                raise ValueError(
+                    f"Frontmatter must have 'name' and 'description' in {skill_file}"
+                )
+
+            if name in skills:
+                raise ValueError(f"Duplicate skill name '{name}'")
+            
+            metadata = f"name:{name}\ndescription:{description}"
+
+            skills[name] = {"metadata": metadata, "content": content}
+
+        return skills
+
 
     def query_language_model(self) -> dict[str, Any]:
         """Send one tool-enabled Chat Completions request and normalize it."""
@@ -214,7 +266,7 @@ class Agent:
 
     def process_response(self, response: Any) -> dict[str, Any]:
         """Return relevant parts of the language model's response."""
-
+        
         return response.choices[0].message.model_dump(exclude_none=True)
 
     def build_prompt(self) -> list[dict[str, Any]]:
@@ -227,7 +279,18 @@ class Agent:
 
         # You want to be careful about which attributes of the class you modify
         # here as they may also be handled by the subclasses.
-        raise NotImplementedError
+        messages: list[dict[str, Any]] = []
+
+        # 1.System prompt
+        messages.append({"role": "system", "content": self.system_prompt})
+
+        # 2.user message
+        messages.append({"role": "user", "content": self.task_prompt})
+
+        # 3.history
+        messages.extend(self.messages)
+
+        return messages
 
     def estimate_active_prompt_tokens(self) -> int:
         """Estimate the next prompt, calibrated by the provider's latest usage."""
@@ -264,7 +327,7 @@ class Agent:
         # messages verbatim and at least the latest complete assistant action
         # with all linked tool observations. The resulting summary should change
         # what `build_prompt` emits, and reduce the length of the prompt.
-
+        
         raise NotImplementedError
 
         compaction_prompt = []
@@ -335,8 +398,30 @@ class Agent:
             # request in your shared loop. It already estimates active tokens
             # and handles the threshold, and tracks compaction events for
             # logging.
+            while not self.finished:
+                # check step_limit
+                if self.steps_taken >= self.step_limit:
+                    raise StepLimitError(f"Agent exceeded step limit of {self.step_limit}")
+                
+                # check compact_context
+                self.maybe_compact_context() 
 
-            raise NotImplementedError
+                # 1.invoke llm
+                message = self.query_language_model()
+
+                # 2.append assistant message
+                self.messages.append(message)
+
+                # 3.extracted tool calls
+                observations = message.get("tool_calls")
+
+                if observations:
+                    # 4.excute tool
+                    result = self.execute_tool_calls(observations)
+
+                    self.messages.extend(result)
+                else:
+                    pass
         finally:
             # This block is provided infrastructure. Do not modify it: a
             # trajectory is required even when a run fails.
